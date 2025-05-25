@@ -339,8 +339,15 @@ func main() {
 
 	if err := rcvr.NewReceiver(); err != nil {
 		log.Printf("Error initializing receiver: %+v\n", err)
+		// If rcvr.SDR was successfully connected by rcvr.Connect()
+		// but NewReceiver failed later, Close the SDR connection.
+		// rtltcp.SDR.Close() is safe to call even if not connected.
+		rcvr.SDR.Close()
 		os.Exit(1)
 	}
+
+	// Defer rcvr.Close() here to catch panics or unexpected exits after successful initialization
+	defer rcvr.Close()
 
 	defer func() {
 		if c, ok := sampleWriter.(io.Closer); ok {
