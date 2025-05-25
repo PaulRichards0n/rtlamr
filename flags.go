@@ -121,20 +121,20 @@ func EnvOverride() {
 	})
 }
 
-func HandleFlags() {
+func HandleFlags() error {
 	var err error
 
 	switch *symbolLength {
 	case 8, 32, 40, 48, 56, 64, 72, 80, 88, 96:
 		break
 	default:
-		log.Fatal("invalid symbollength")
+		return fmt.Errorf("invalid symbollength: %d", *symbolLength)
 	}
 
 	if *sampleFile != os.DevNull {
 		sampleWriter, err = os.Create(*sampleFile)
 		if err != nil {
-			log.Fatal("Error creating sample file:", err)
+			return fmt.Errorf("error creating sample file %s: %w", *sampleFile, err)
 		}
 	}
 
@@ -149,6 +149,7 @@ func HandleFlags() {
 	case "xml":
 		encoder = NewLineEncoder{xml.NewEncoder(os.Stdout)}
 	}
+	return nil
 }
 
 // JSON, XML and GOB all implement this interface so we can simplify log

@@ -56,12 +56,35 @@ type Receiver struct {
 	err error
 }
 
-func (rcvr *Receiver) NewReceiver() {
+func (rcvr *Receiver) NewReceiver() error {
 	rcvr.ctx, rcvr.cancel = context.WithCancel(context.Background())
 	rcvr.wg = &sync.WaitGroup{}
-
 	rcvr.d = protocol.NewDecoder()
 
+	if err := rcvr.registerMessageParsers(); err != nil {
+		return err
+	}
+
+	// Allocate the internal buffers of the decoder.
+	rcvr.d.Allocate()
+
+	// Connect to rtl_tcp server.
+	if err := rcvr.Connect(nil); err != nil {
+		rcvr.err = err // Assign to rcvr.err for potential later inspection if needed
+		return errors.Wrap(err, "rcvr.Connect")
+	}
+
+	rcvr.configureSDRFromFlags()
+
+	rcvr.d.Log()
+
+	// Tell the user how many gain settings were reported by rtl_tcp.
+	log.Println("GainCount:", rcvr.SDR.Info.GainCount)
+	return nil
+}
+
+// registerMessageParsers handles the msgType global and registers protocols with the decoder.
+func (rcvr *Receiver) registerMessageParsers() error {
 	// If the msgtype "all" is given alone, register and use scm, scm+, idm and r900.
 	if _, all := msgType["all"]; all && len(msgType) == 1 {
 		delete(msgType, "all")
@@ -75,23 +98,18 @@ func (rcvr *Receiver) NewReceiver() {
 	for name := range msgType {
 		p, err := protocol.NewParser(name, *symbolLength)
 		if err != nil {
-			log.Fatal(err)
+			return fmt.Errorf("error creating parser for type %s: %w", name, err)
 		}
-
 		rcvr.d.RegisterProtocol(p)
 	}
+	return nil
+}
 
-	// Allocate the internal buffers of the decoder.
-	rcvr.d.Allocate()
-
-	// Connect to rtl_tcp server.
-	if rcvr.err = rcvr.Connect(nil); rcvr.err != nil {
-		log.Fatalf("%+v", errors.Wrap(rcvr.err, "rcvr.Connect"))
-	}
-
-	cfg := rcvr.d.Cfg
-
+// configureSDRFromFlags processes flags and configures SDR parameters.
+func (rcvr *Receiver) configureSDRFromFlags() {
+	cfg := rcvr.d.Cfg // Get a mutable copy of the config
 	gainFlagSet := false
+
 	flag.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "centerfreq":
@@ -117,12 +135,7 @@ func (rcvr *Receiver) NewReceiver() {
 	if !gainFlagSet {
 		rcvr.SetGainMode(true)
 	}
-
-	rcvr.d.Cfg = cfg
-	rcvr.d.Log()
-
-	// Tell the user how many gain settings were reported by rtl_tcp.
-	log.Println("GainCount:", rcvr.SDR.Info.GainCount)
+	rcvr.d.Cfg = cfg // Assign the modified config back
 }
 
 func (rcvr *Receiver) Close() {
@@ -152,133 +165,150 @@ func (rcvr *Receiver) Run() {
 	}()
 
 	// Read and send sample blocks to the decoder.
-	go func() {
-		defer rcvr.cancel()
-		defer close(blockCh)
-		defer rcvr.wg.Done()
+	go rcvr.readSampleBlocks(blockCh)
 
-		// Make two sample blocks, one for reading, and one for the receiver to
-		// decode, these are exchanged each time we read a new block.
-		blockA := make([]byte, rcvr.d.Cfg.BlockSize2)
-		blockB := make([]byte, rcvr.d.Cfg.BlockSize2)
+	// Process decoded messages
+	go rcvr.processDecodedMessages(blockCh, sampleBuf, prev, next)
+}
 
-		for {
-			select {
-			// Exit if we've been told to stop.
-			case <-rcvr.ctx.Done():
+// processDecodedMessages receives sample blocks from blockCh, decodes messages,
+// filters them, encodes them, and writes raw samples.
+// It is intended to be run as a goroutine.
+func (rcvr *Receiver) processDecodedMessages(blockCh <-chan []byte, sampleBuf *bytes.Buffer, prev, next map[protocol.Digest]bool) {
+	defer rcvr.cancel()
+	defer rcvr.wg.Done()
+
+	for {
+		select {
+		case <-rcvr.ctx.Done():
+			return
+		case block, ok := <-blockCh:
+			if !ok {
+				// channel closed
 				return
-			default:
-				rcvr.err = rcvr.SetDeadline(time.Now().Add(5 * time.Second))
-				if rcvr.err != nil {
-					rcvr.err = errors.Wrap(rcvr.err, "rcvr.SetDeadline")
-					return
-				}
-
-				// Read new sample block.
-				_, rcvr.err = io.ReadFull(rcvr, blockA)
-				if rcvr.err != nil {
-					rcvr.err = errors.Wrap(rcvr.err, "io.ReadFull")
-					return
-				}
-
-				// Send the sample block.
-				blockCh <- blockA
-
-				// Exchange blocks for next read.
-				blockA, blockB = blockB, blockA
 			}
-		}
-	}()
 
-	go func() {
-		defer rcvr.cancel()
-		defer rcvr.wg.Done()
+			// Clear next map for this sample block.
+			for key := range next {
+				delete(next, key)
+			}
 
-		for {
-			select {
-			case <-rcvr.ctx.Done():
-				return
-			case block, ok := <-blockCh:
-				if !ok {
+			// Discard the oldest block from the buffer if
+			// it's full and write the new block to it.
+			if sampleBuf.Len() > rcvr.d.Cfg.BufferLength<<1 {
+				io.CopyN(io.Discard, sampleBuf, int64(len(block)))
+			}
+			sampleBuf.Write(block)
+
+			pktFound := false
+
+			// For each message returned
+			for msg := range rcvr.d.Decode(block) {
+				// If the filterchain rejects the message, skip it.
+				if !rcvr.fc.Match(msg) {
 					continue
 				}
 
-				// Clear next map for this sample block.
-				for key := range next {
-					delete(next, key)
+				// Make a new LogMessage
+				var logMsg protocol.LogMessage
+				logMsg.Time = time.Now()
+				if s, ok := sampleWriter.(io.Seeker); ok {
+					logMsg.Offset, _ = s.Seek(0, io.SeekCurrent)
+				}
+				logMsg.Length = sampleBuf.Len()
+				logMsg.Type = msg.MsgType()
+				logMsg.Message = msg
+
+				// This should be unique enough to identify a message between blocks.
+				msgDigest := protocol.NewDigest(msg)
+
+				// Mark the message as seen for the next loop.
+				next[msgDigest] = true
+
+				// If the message was seen in the previous loop, skip it.
+				if prev[msgDigest] {
+					continue
 				}
 
-				// Discard the oldest block from the buffer if
-				// it's full and write the new block to it.
-				if sampleBuf.Len() > rcvr.d.Cfg.BufferLength<<1 {
-					io.CopyN(io.Discard, sampleBuf, int64(len(block)))
-				}
-				sampleBuf.Write(block)
-
-				pktFound := false
-
-				// For each message returned
-				for msg := range rcvr.d.Decode(block) {
-					// If the filterchain rejects the message, skip it.
-					if !rcvr.fc.Match(msg) {
-						continue
-					}
-
-					// Make a new LogMessage
-					var logMsg protocol.LogMessage
-					logMsg.Time = time.Now()
-					if s, ok := sampleWriter.(io.Seeker); ok {
-						logMsg.Offset, _ = s.Seek(0, io.SeekCurrent)
-					}
-					logMsg.Length = sampleBuf.Len()
-					logMsg.Type = msg.MsgType()
-					logMsg.Message = msg
-
-					// This should be unique enough to identify a message between blocks.
-					msgDigest := protocol.NewDigest(msg)
-
-					// Mark the message as seen for the next loop.
-					next[msgDigest] = true
-
-					// If the message was seen in the previous loop, skip it.
-					if prev[msgDigest] {
-						continue
-					}
-
-					// Encode the message
-					rcvr.err = encoder.Encode(logMsg)
-					rcvr.err = errors.Wrap(rcvr.err, "encoder.Encode")
-
-					if rcvr.err != nil {
-						return
-					}
-
-					pktFound = true
-					if *single {
-						if len(meterID.UintMap) == 0 {
-							break
-						} else {
-							delete(meterID.UintMap, uint(msg.MeterID()))
-						}
-					}
+				// Encode the message
+				err := encoder.Encode(logMsg)
+				if err != nil {
+					rcvr.err = errors.Wrap(err, "encoder.Encode in processDecodedMessages")
+					return
 				}
 
-				if pktFound {
-					_, err := sampleWriter.Write(sampleBuf.Bytes())
-					if err != nil {
-						log.Fatal("Error writing raw samples to file:", err)
-					}
-					if *single && len(meterID.UintMap) == 0 {
-						rcvr.cancel()
-						return
+				pktFound = true
+				if *single {
+					if len(meterID.UintMap) == 0 {
+						// This break will exit the inner loop (rcvr.d.Decode)
+						// The outer loop (select) will continue.
+						// If single is true and all IDs are found, we want to cancel.
+						// This is handled below by checking *single && len(meterID.UintMap) == 0
+						// after the pktFound block.
+						break
+					} else {
+						delete(meterID.UintMap, uint(msg.MeterID()))
 					}
 				}
-
-				// Swap next and previous digest maps.
-				next, prev = prev, next
 			}
+
+			if pktFound {
+				_, err := sampleWriter.Write(sampleBuf.Bytes())
+				if err != nil {
+					rcvr.err = errors.Wrap(err, "error writing raw samples to file in processDecodedMessages")
+					rcvr.cancel()
+					return
+				}
+				if *single && len(meterID.UintMap) == 0 {
+					rcvr.cancel()
+					return
+				}
+			}
+
+			// Swap next and previous digest maps.
+			next, prev = prev, next
 		}
-	}()
+	}
+}
+
+// readSampleBlocks reads sample blocks from the SDR and sends them to blockCh.
+// It is intended to be run as a goroutine.
+func (rcvr *Receiver) readSampleBlocks(blockCh chan<- []byte) {
+	defer rcvr.cancel()
+	defer close(blockCh)
+	defer rcvr.wg.Done()
+
+	// Make two sample blocks, one for reading, and one for the receiver to
+	// decode, these are exchanged each time we read a new block.
+	blockA := make([]byte, rcvr.d.Cfg.BlockSize2)
+	blockB := make([]byte, rcvr.d.Cfg.BlockSize2)
+
+	for {
+		select {
+		// Exit if we've been told to stop.
+		case <-rcvr.ctx.Done():
+			return
+		default:
+			err := rcvr.SetDeadline(time.Now().Add(5 * time.Second))
+			if err != nil {
+				rcvr.err = errors.Wrap(err, "rcvr.SetDeadline in readSampleBlocks")
+				return
+			}
+
+			// Read new sample block.
+			_, err = io.ReadFull(rcvr, blockA)
+			if err != nil {
+				rcvr.err = errors.Wrap(err, "io.ReadFull in readSampleBlocks")
+				return
+			}
+
+			// Send the sample block.
+			blockCh <- blockA
+
+			// Exchange blocks for next read.
+			blockA, blockB = blockB, blockA
+		}
+	}
 }
 
 func init() {
@@ -296,24 +326,27 @@ func main() {
 		if info, ok := debug.ReadBuildInfo(); ok {
 			fmt.Printf("%+v\n", info)
 		} else {
-			log.Fatal("could not read build info")
+			log.Printf("Error: could not read build info")
+			os.Exit(1)
 		}
 		os.Exit(0)
 	}
 
-	HandleFlags()
+	if err := HandleFlags(); err != nil {
+		log.Printf("Error handling flags: %+v\n", err)
+		os.Exit(1)
+	}
 
-	rcvr.NewReceiver()
+	if err := rcvr.NewReceiver(); err != nil {
+		log.Printf("Error initializing receiver: %+v\n", err)
+		os.Exit(1)
+	}
 
 	defer func() {
 		if c, ok := sampleWriter.(io.Closer); ok {
 			c.Close()
 		}
-		rcvr.Close()
-
-		if rcvr.err != nil {
-			log.Fatalf("%+v\n", rcvr.err)
-		}
+		// rcvr.Close() is called later to ensure error checking
 	}()
 
 	start := time.Now()
@@ -339,4 +372,10 @@ func main() {
 	}
 
 	rcvr.Close()
+
+	// Check for errors from the receiver
+	if rcvr.err != nil {
+		log.Printf("Error during receiver operation: %+v\n", rcvr.err)
+		os.Exit(1)
+	}
 }
